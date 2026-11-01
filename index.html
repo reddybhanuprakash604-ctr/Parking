@@ -1,0 +1,787 @@
+/*
+  ESP32 SMART ROVER
+  ESP32 + L298N + HC-SR04 + I2C LCD
+  ESP32 Arduino Core 2.0.17
+
+  Wi-Fi: SmartBraking-Car
+  Password: 12345678
+  Dashboard: http://192.168.4.1
+
+  IMPORTANT DISTANCE RULE:
+  Valid distance < 70 cm : Stop FORWARD movement
+  Valid distance >= 70 cm: Do not stop because of distance
+  70-100 cm              : Caution only
+  Invalid sensor reading : Show sensor error, not fake distance
+
+  Reverse remains available to move away from an obstacle.
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ================= WIFI =================
+
+const char* WIFI_SSID = "SmartBraking-Car";
+const char* WIFI_PASSWORD = "12345678";
+
+WebServer server(80);
+
+// ================= L298N PINS =================
+
+// Left motor
+const int ENA = 25;
+const int IN1 = 26;
+const int IN2 = 27;
+
+// Right motor
+const int ENB = 32;
+const int IN3 = 33;
+const int IN4 = 4;
+
+// ================= HC-SR04 =================
+
+const int TRIG_PIN = 5;
+const int ECHO_PIN = 18;
+
+// ================= LCD =================
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ================= PWM =================
+
+const int PWM_FREQ = 1000;
+const int PWM_RESOLUTION = 8;
+const int PWM_LEFT_CHANNEL = 0;
+const int PWM_RIGHT_CHANNEL = 1;
+
+// ================= DISTANCE SETTINGS =================
+
+const float STOP_DISTANCE = 70.0f;
+const float CAUTION_DISTANCE = 100.0f;
+
+// Sensor readings are accepted only within this range.
+const float MIN_VALID_DISTANCE = 2.0f;
+const float MAX_VALID_DISTANCE = 400.0f;
+
+// ================= MOTOR STATE =================
+
+enum Motion {
+  STOPPED,
+  FORWARD,
+  REVERSE,
+  LEFT,
+  RIGHT
+};
+
+Motion currentMotion = STOPPED;
+
+int motorSpeed = 170;
+
+// ================= DISTANCE STATE =================
+
+// Three valid measurements for a median filter.
+float distanceSamples[3] = {0, 0, 0};
+int sampleCount = 0;
+int sampleIndex = 0;
+
+float distanceCm = -1.0f;
+bool distanceValid = false;
+bool sensorError = true;
+
+bool collisionActive = false;
+bool previousCollision = false;
+
+unsigned long lastDistanceRead = 0;
+unsigned long lastLCDUpdate = 0;
+
+const unsigned long SENSOR_INTERVAL_MS = 70;
+const unsigned long LCD_INTERVAL_MS = 250;
+
+// ================= DEMO MAP LOCATIONS =================
+// These are demo coordinates, not live GPS locations.
+
+struct DemoPoint {
+  float lat;
+  float lon;
+};
+
+DemoPoint demoPoints[] = {
+  {17.562646, 78.443972},
+  {17.562803, 78.443946},
+  {17.562702, 78.443933},
+  {17.562360, 78.443965},
+  {17.562427, 78.444253}
+};
+
+const int NUM_POINTS =
+  sizeof(demoPoints) / sizeof(demoPoints[0]);
+
+int selectedPoint = 0;
+
+// ================= MOTOR CONTROL =================
+
+void stopMotors() {
+  ledcWrite(PWM_LEFT_CHANNEL, 0);
+  ledcWrite(PWM_RIGHT_CHANNEL, 0);
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+
+  currentMotion = STOPPED;
+}
+
+void setLeftMotor(bool forward, int pwm) {
+  pwm = constrain(pwm, 0, 255);
+
+  if (pwm == 0) {
+    ledcWrite(PWM_LEFT_CHANNEL, 0);
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+    return;
+  }
+
+  digitalWrite(IN1, forward ? HIGH : LOW);
+  digitalWrite(IN2, forward ? LOW : HIGH);
+
+  ledcWrite(PWM_LEFT_CHANNEL, pwm);
+}
+
+void setRightMotor(bool forward, int pwm) {
+  pwm = constrain(pwm, 0, 255);
+
+  if (pwm == 0) {
+    ledcWrite(PWM_RIGHT_CHANNEL, 0);
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+    return;
+  }
+
+  digitalWrite(IN3, forward ? HIGH : LOW);
+  digitalWrite(IN4, forward ? LOW : HIGH);
+
+  ledcWrite(PWM_RIGHT_CHANNEL, pwm);
+}
+
+void driveForward() {
+  // Exact rule: STOP only when a valid distance is BELOW 70 cm.
+  if (distanceValid && distanceCm < STOP_DISTANCE) {
+    stopMotors();
+    return;
+  }
+
+  setLeftMotor(true, motorSpeed);
+  setRightMotor(true, motorSpeed);
+  currentMotion = FORWARD;
+}
+
+void driveReverse() {
+  setLeftMotor(false, motorSpeed);
+  setRightMotor(false, motorSpeed);
+  currentMotion = REVERSE;
+}
+
+void turnLeft() {
+  setLeftMotor(false, motorSpeed);
+  setRightMotor(true, motorSpeed);
+  currentMotion = LEFT;
+}
+
+void turnRight() {
+  setLeftMotor(true, motorSpeed);
+  setRightMotor(false, motorSpeed);
+  currentMotion = RIGHT;
+}
+
+// ================= HC-SR04 RAW READING =================
+
+float readRawDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration =
+    pulseIn(ECHO_PIN, HIGH, 30000UL);
+
+  if (duration == 0) {
+    return -1.0f;
+  }
+
+  float cm = duration * 0.0343f / 2.0f;
+
+  if (cm < MIN_VALID_DISTANCE ||
+      cm > MAX_VALID_DISTANCE) {
+    return -1.0f;
+  }
+
+  return cm;
+}
+
+// ================= MEDIAN FILTER =================
+
+float medianOfThree(float a, float b, float c) {
+  if (a > b) {
+    float temp = a;
+    a = b;
+    b = temp;
+  }
+
+  if (b > c) {
+    float temp = b;
+    b = c;
+    c = temp;
+  }
+
+  if (a > b) {
+    float temp = a;
+    a = b;
+    b = temp;
+  }
+
+  return b;
+}
+
+void updateDistanceSensor() {
+  float raw = readRawDistanceCM();
+
+  // Invalid echo: never turn it into an invented distance.
+  if (raw < 0) {
+    Serial.println("HC-SR04: Invalid echo");
+
+    // Retain the last filtered distance for diagnostics,
+    // but do not use stale data as a new measurement.
+    // After a missing reading, wait for 3 new valid
+    // measurements before trusting the distance again.
+    sampleCount = 0;
+    sampleIndex = 0;
+    distanceValid = false;
+    sensorError = true;
+    distanceCm = -1.0f;
+
+    return;
+  }
+
+  Serial.print("Raw distance: ");
+  Serial.print(raw, 1);
+  Serial.println(" cm");
+
+  distanceSamples[sampleIndex] = raw;
+  sampleIndex = (sampleIndex + 1) % 3;
+
+  if (sampleCount < 3) {
+    sampleCount++;
+  }
+
+  // Require three consecutive valid readings.
+  if (sampleCount < 3) {
+    distanceValid = false;
+    sensorError = true;
+    distanceCm = -1.0f;
+    return;
+  }
+
+  distanceCm = medianOfThree(
+    distanceSamples[0],
+    distanceSamples[1],
+    distanceSamples[2]
+  );
+
+  distanceValid = true;
+  sensorError = false;
+
+  Serial.print("Filtered distance: ");
+  Serial.print(distanceCm, 1);
+  Serial.println(" cm");
+
+  Serial.println("----------------------");
+}
+
+// ================= COLLISION STATE =================
+
+bool isBelowStopDistance() {
+  // Strict comparison: exactly 70 cm does NOT trigger a stop.
+  return distanceValid && distanceCm < STOP_DISTANCE;
+}
+
+bool isCautionDistance() {
+  return distanceValid &&
+         distanceCm >= STOP_DISTANCE &&
+         distanceCm <= CAUTION_DISTANCE;
+}
+
+void updateCollisionState() {
+  collisionActive = isBelowStopDistance();
+
+  if (collisionActive && !previousCollision) {
+    selectedPoint = random(NUM_POINTS);
+
+    Serial.println("OBSTACLE BELOW 70 CM!");
+    Serial.println("Forward motor stop triggered.");
+  }
+
+  previousCollision = collisionActive;
+
+  // Only the forward direction is blocked by this rule.
+  // Reverse and steering commands remain available.
+  if (currentMotion == FORWARD && collisionActive) {
+    stopMotors();
+  }
+}
+
+// ================= WEB DASHBOARD =================
+
+const char PAGE[] PROGMEM = R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart Rover</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#eef2f7;color:#172033;font-family:Arial,sans-serif}
+header{background:#172b4d;color:white;padding:11px 15px;display:flex;justify-content:space-between;align-items:center}
+header h2{font-size:19px;margin:0}
+small,.muted{color:#64748b;font-size:12px}
+header small{color:#cbd5e1}
+.container{max-width:470px;margin:12px auto;padding:0 12px}
+.card{background:white;border-radius:13px;padding:13px;margin-bottom:11px;box-shadow:0 2px 8px #0000000d}
+.row{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.distance{font-size:29px;font-weight:800}
+.pill{display:inline-block;border-radius:8px;padding:7px 10px;background:#dcfce7;color:#166534;font-size:12px;font-weight:bold}
+.caution{background:#fef3c7;color:#92400e}
+.danger{background:#fee2e2;color:#991b1b}
+.pad{width:222px;max-width:100%;margin:12px auto;display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.drive{height:60px;border:1px solid #d7dfeb;border-radius:12px;background:#f8fafc;color:#1e293b;display:flex;align-items:center;justify-content:center;touch-action:none;user-select:none}
+.drive svg{width:29px;height:29px;fill:none;stroke:currentColor;stroke-width:2.8;stroke-linecap:round;stroke-linejoin:round}
+.drive.active{background:#2563eb;color:white;border-color:#2563eb}
+.drive.stop{background:#fee2e2;color:#b91c1c}
+.drive.stop.active{background:#dc2626;color:white}
+.empty{visibility:hidden}
+input[type=range]{width:100%;accent-color:#2563eb;margin:16px 0}
+#location{background:#fff7ed;border:1px solid #fed7aa;padding:11px;border-radius:9px;margin-top:10px}
+#location a{display:inline-block;margin-top:8px;color:#1d4ed8;font-size:13px;font-weight:bold}
+.hidden{display:none!important}
+.note{text-align:center;color:#64748b;font-size:11px;padding-bottom:12px}
+</style>
+</head>
+<body>
+<header>
+  <div><h2>Smart Rover</h2><small>Wireless motor control</small></div>
+  <span id="connection" class="pill">Connecting</span>
+</header>
+
+<div class="container">
+  <div class="card">
+    <div class="row">
+      <div>
+        <div class="muted">OBSTACLE DISTANCE</div>
+        <span id="distance" class="distance">---</span>
+        <span class="muted" id="unit">cm</span>
+      </div>
+      <span id="status" class="pill">Checking</span>
+    </div>
+    <div class="muted" id="motion">Motor stopped</div>
+    <div id="location" class="hidden">
+      <b>Forward stop triggered</b>
+      <p class="muted">Demo coordinates only, not live GPS.</p>
+      <div id="coords"></div>
+      <a id="maplink" target="_blank">Open demo point in Google Maps</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row"><b>Direction control</b><span class="muted">Hold to move</span></div>
+    <div class="pad">
+      <div class="empty"></div>
+      <button class="drive" data-dir="forward" aria-label="Forward">
+        <svg viewBox="0 0 24 24"><path d="M12 20V4M5 11l7-7 7 7"/></svg>
+      </button>
+      <div class="empty"></div>
+
+      <button class="drive" data-dir="left" aria-label="Left">
+        <svg viewBox="0 0 24 24"><path d="M20 12H4M11 5l-7 7 7 7"/></svg>
+      </button>
+      <button class="drive stop" id="stop" aria-label="Stop">
+        <svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>
+      </button>
+      <button class="drive" data-dir="right" aria-label="Right">
+        <svg viewBox="0 0 24 24"><path d="M4 12h16M13 5l7 7-7 7"/></svg>
+      </button>
+
+      <div class="empty"></div>
+      <button class="drive" data-dir="reverse" aria-label="Reverse">
+        <svg viewBox="0 0 24 24"><path d="M12 4v16M5 13l7 7 7-7"/></svg>
+      </button>
+      <div class="empty"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row"><b>Motor speed</b><b id="speedvalue">170</b></div>
+    <input id="speed" type="range" min="0" max="255" value="170">
+    <div class="row muted"><span>Slow</span><span>Fast</span></div>
+  </div>
+  <div class="note">Caution at 100 cm · Forward stop strictly below 70 cm</div>
+</div>
+
+<script>
+let currentSpeed=170;
+let currentDir="";
+let blocked=false;
+
+const slider=document.getElementById("speed");
+const stopButton=document.getElementById("stop");
+
+function requestURL(url){
+  return fetch(url,{cache:"no-store"}).catch(()=>{});
+}
+
+function sendMove(dir){
+  currentDir=dir;
+  requestURL("/move?dir="+encodeURIComponent(dir)+"&speed="+currentSpeed);
+}
+
+function stopMove(){
+  currentDir="";
+  document.querySelectorAll(".drive").forEach(b=>b.classList.remove("active"));
+  requestURL("/stop");
+}
+
+document.querySelectorAll("[data-dir]").forEach(button=>{
+  const dir=button.dataset.dir;
+
+  button.addEventListener("pointerdown",e=>{
+    e.preventDefault();
+
+    if(dir==="forward" && blocked){
+      stopMove();
+      return;
+    }
+
+    document.querySelectorAll("[data-dir]").forEach(b=>b.classList.remove("active"));
+    button.classList.add("active");
+
+    try{button.setPointerCapture(e.pointerId)}catch(err){}
+    sendMove(dir);
+  });
+
+  function release(){
+    if(button.classList.contains("active")){
+      button.classList.remove("active");
+      stopMove();
+    }
+  }
+
+  button.addEventListener("pointerup",release);
+  button.addEventListener("pointercancel",release);
+  button.addEventListener("lostpointercapture",release);
+});
+
+stopButton.addEventListener("pointerdown",()=>{
+  stopButton.classList.add("active");
+  stopMove();
+});
+stopButton.addEventListener("pointerup",()=>stopButton.classList.remove("active"));
+stopButton.addEventListener("pointercancel",()=>stopButton.classList.remove("active"));
+
+slider.addEventListener("input",()=>{
+  currentSpeed=Number(slider.value);
+  document.getElementById("speedvalue").textContent=currentSpeed;
+  requestURL("/speed?value="+currentSpeed);
+});
+
+async function refreshStatus(){
+  try{
+    const response=await fetch("/status",{cache:"no-store"});
+    if(!response.ok)throw Error("offline");
+    const d=await response.json();
+
+    document.getElementById("connection").textContent="Connected";
+
+    const distanceEl=document.getElementById("distance");
+    const unitEl=document.getElementById("unit");
+    const statusEl=document.getElementById("status");
+
+    blocked=Boolean(d.blocked);
+
+    if(d.sensorError){
+      distanceEl.textContent="ERR";
+      unitEl.textContent="";
+      statusEl.textContent="SENSOR ERROR";
+      statusEl.className="pill danger";
+    }else{
+      distanceEl.textContent=Number(d.distance).toFixed(1);
+      unitEl.textContent="cm";
+
+      if(d.collision){
+        statusEl.textContent="STOP";
+        statusEl.className="pill danger";
+      }else if(d.warning){
+        statusEl.textContent="CAUTION";
+        statusEl.className="pill caution";
+      }else{
+        statusEl.textContent="CLEAR";
+        statusEl.className="pill";
+      }
+    }
+
+    document.getElementById("motion").textContent="Motor: "+d.motion;
+
+    const location=document.getElementById("location");
+
+    if(d.collision){
+      location.classList.remove("hidden");
+      document.getElementById("coords").textContent=
+        Number(d.lat).toFixed(6)+", "+Number(d.lon).toFixed(6);
+      document.getElementById("maplink").href=
+        "https://www.google.com/maps?q="+d.lat+","+d.lon;
+    }else{
+      location.classList.add("hidden");
+    }
+
+    if(blocked && currentDir==="forward"){
+      stopMove();
+    }
+  }catch(e){
+    document.getElementById("connection").textContent="Disconnected";
+  }
+}
+
+setInterval(refreshStatus,250);
+refreshStatus();
+</script>
+</body>
+</html>
+)HTML";
+
+// ================= HTTP HANDLERS =================
+
+String motionName() {
+  switch (currentMotion) {
+    case FORWARD: return "FORWARD";
+    case REVERSE: return "REVERSE";
+    case LEFT:    return "LEFT";
+    case RIGHT:   return "RIGHT";
+    default:      return "STOPPED";
+  }
+}
+
+void handleRoot() {
+  server.send_P(200, "text/html", PAGE);
+}
+
+void handleMove() {
+  String dir = server.arg("dir");
+  dir.toLowerCase();
+
+  if (server.hasArg("speed")) {
+    motorSpeed = constrain(server.arg("speed").toInt(), 0, 255);
+  }
+
+  if (dir == "forward") {
+    if (isBelowStopDistance()) {
+      stopMotors();
+      server.send(200, "text/plain", "BLOCKED: BELOW 70 CM");
+      return;
+    }
+    driveForward();
+  } else if (dir == "reverse") {
+    driveReverse();
+  } else if (dir == "left") {
+    turnLeft();
+  } else if (dir == "right") {
+    turnRight();
+  } else {
+    stopMotors();
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
+void handleStop() {
+  stopMotors();
+  server.send(200, "text/plain", "STOPPED");
+}
+
+void handleSpeed() {
+  if (server.hasArg("value")) {
+    motorSpeed = constrain(server.arg("value").toInt(), 0, 255);
+  }
+
+  switch (currentMotion) {
+    case FORWARD:
+      if (isBelowStopDistance()) {
+        stopMotors();
+      } else {
+        driveForward();
+      }
+      break;
+
+    case REVERSE:
+      driveReverse();
+      break;
+
+    case LEFT:
+      turnLeft();
+      break;
+
+    case RIGHT:
+      turnRight();
+      break;
+
+    default:
+      stopMotors();
+      break;
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
+void handleStatus() {
+  DemoPoint point = demoPoints[selectedPoint];
+
+  bool blocked = isBelowStopDistance();
+  bool warning = isCautionDistance();
+
+  String json = "{";
+  json += "\"distance\":" + String(distanceValid ? distanceCm : -1.0f, 1) + ",";
+  json += "\"sensorError\":" + String(sensorError ? "true" : "false") + ",";
+  json += "\"warning\":" + String(warning ? "true" : "false") + ",";
+  json += "\"collision\":" + String(blocked ? "true" : "false") + ",";
+  json += "\"blocked\":" + String(blocked ? "true" : "false") + ",";
+  json += "\"motion\":\"" + motionName() + "\",";
+  json += "\"speed\":" + String(motorSpeed) + ",";
+  json += "\"lat\":" + String(point.lat, 6) + ",";
+  json += "\"lon\":" + String(point.lon, 6);
+  json += "}";
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+// ================= LCD =================
+
+void updateLCD() {
+  lcd.setCursor(0, 0);
+
+  if (!distanceValid) {
+    lcd.print("Dist: SENSOR ERR");
+  } else {
+    char line[17];
+    snprintf(line, sizeof(line), "Dist: %5.1f cm", distanceCm);
+    lcd.print(line);
+
+    // Fill remaining LCD characters with spaces.
+    int len = strlen(line);
+    while (len < 16) {
+      lcd.print(' ');
+      len++;
+    }
+  }
+
+  lcd.setCursor(0, 1);
+
+  if (!distanceValid) {
+    lcd.print("Waiting for echo");
+  } else if (distanceCm < STOP_DISTANCE) {
+    lcd.print("STOP: BELOW 70cm");
+  } else if (distanceCm <= CAUTION_DISTANCE) {
+    lcd.print("CAUTION 70-100cm");
+  } else {
+    switch (currentMotion) {
+      case FORWARD: lcd.print("Drive: FORWARD  "); break;
+      case REVERSE: lcd.print("Drive: REVERSE  "); break;
+      case LEFT:    lcd.print("Drive: LEFT     "); break;
+      case RIGHT:   lcd.print("Drive: RIGHT    "); break;
+      default:      lcd.print("Drive: STOPPED  "); break;
+    }
+  }
+}
+
+// ================= SETUP =================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  pinMode(ENB, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // ESP32 Arduino Core 2.0.17 PWM API
+  ledcSetup(PWM_LEFT_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(PWM_RIGHT_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(ENA, PWM_LEFT_CHANNEL);
+  ledcAttachPin(ENB, PWM_RIGHT_CHANNEL);
+
+  stopMotors();
+
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("SMART ROVER");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting WiFi");
+
+  randomSeed(micros());
+
+  // Establish three readings before enabling valid distance logic.
+  for (int i = 0; i < 3; i++) {
+    float raw = readRawDistanceCM();
+
+    if (raw >= MIN_VALID_DISTANCE &&
+        raw <= MAX_VALID_DISTANCE) {
+      distanceSamples[sampleIndex] = raw;
+      sampleIndex = (sampleIndex + 1) % 3;
+      sampleCount++;
+    }
+
+    delay(70);
+  }
+
+  if (sampleCount == 3) {
+    distanceCm = medianOfThree(
+      distanceSamples[0],
+      distanceSamples[1],
+      distanceSamples[2]
+    );
+    distanceValid = true;
+    sensorError = false;
+  }
+
+  collisionActive = isBelowStopDistance();
+  previousCollision = collisionActive;
+
+  if (collisionActive) {
+    selectedPoint = random(NUM_POINTS);
+  }
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.println();
+  Serial.println("Smart Rover started");
+  Serial.print("Wi-Fi: ");
+  Serial.println(WIFI_SSID);
+  Serial.print("Dashboard: http://");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/move", HTTP_GET, handleMove);
+  server.on("/stop", HTTP_GET, handleStop);
+  server.on("/speed", HTTP
